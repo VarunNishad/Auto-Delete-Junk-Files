@@ -1,0 +1,6 @@
+last_run.txt
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+*.log
