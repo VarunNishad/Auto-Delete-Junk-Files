@@ -1,3 +1,0 @@
-win10toast
-winshell
-pywin32

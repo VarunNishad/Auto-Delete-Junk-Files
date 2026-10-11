@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --icon="C:\Users\user\Documents\Python Projects\Promotora Timer\Icon.ico" pomodoro_timer.py

@@ -1,6 +1,13 @@
 last_run.txt
+last_run.json
+cleaner_history.csv
+run_silent.bat
 __pycache__/
 *.pyc
 *.pyo
 *.exe
 *.log
+cleaner.log
+handoff_args.json
+handoff_output.log
+*.bak
