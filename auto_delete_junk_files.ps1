@@ -444,6 +444,8 @@ function Clear-TempFolder ([string]$Path, [int]$AgeDays, [bool]$TestMode) {
 # Optional native package-manager cleaners (used only for small caches)
 # ------------------------------------------------------------------------------
 function Invoke-NativeCleaner ([string]$Exe, [string]$Arguments, [int]$TimeoutSec = $NativeTimeoutSec) {
+    # uv, pip, pnpm and go are found on PATH in user-writable folders: never start them elevated
+    if ($script:IsAdmin) { return $false }
     if (-not (Get-Command $Exe -ErrorAction SilentlyContinue)) { return $false }
     try {
         $so = [System.IO.Path]::GetTempFileName()
@@ -583,7 +585,7 @@ function Invoke-Target ($Target, [bool]$TestMode, [bool]$ReportMode, [bool]$Igno
     # Prune removes only what no project references, so nothing in use is downloaded
     # again. The full wipe below stays for a tight disk or -Force (gate 0), or when
     # the tool is not installed.
-    if ($Target.Prune -and $gate -gt 0 -and (Get-Command $Target.Exe -ErrorAction SilentlyContinue)) {
+    if ($Target.Prune -and $gate -gt 0 -and -not $script:IsAdmin -and (Get-Command $Target.Exe -ErrorAction SilentlyContinue)) {
         $how = "$($Target.Exe) $($Target.Prune)"
         if ($TestMode) {
             Write-Color ("  [DRY]   {0,-24} {1,10}  would prune unused entries  ({2})" -f $Target.Name, (Format-Size $size), $how) "Yellow"
@@ -1019,25 +1021,31 @@ function Install-ScheduledTask ([string]$Root) {
     if (-not $script:IsAdmin) { return $false }
     if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) { return $false }
     try {
-        $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-                                                -LogonType Interactive -RunLevel Highest
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                                                   -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2)
         $jobs = @(
-            # no -All: the default run already equals it, and a handoff can then narrow it
-            @{ Name = $TaskName; Args = '-NoGates'; Desc = 'daily temp and developer cache cleanup'
+            # elevated worker, no trigger of its own: the daily task starts it through the handoff
+            @{ Name = $TaskName; Level = 'Highest'; Args = '-CleanSystem'; Desc = 'elevated worker for the system caches' },
+            # not elevated on purpose: it hands the system half to the worker and cleans the
+            # developer caches itself, so uv / pip / pnpm never run with admin rights
+            @{ Name = "${TaskName}Daily"; Level = 'Limited'; Args = '-NoGates'; Desc = 'daily temp and developer cache cleanup'
                Triggers = @((New-ScheduledTaskTrigger -Daily -At 12pm), (New-ScheduledTaskTrigger -AtLogOn)) },
             # New-ScheduledTaskTrigger has no monthly option, so every 4 weeks
-            @{ Name = "${TaskName}Monthly"; Args = '-Maintenance'; Desc = '4-weekly WinSxS cleanup and WSL/Docker disk compaction'
+            @{ Name = "${TaskName}Monthly"; Level = 'Highest'; Args = '-Maintenance'; Desc = '4-weekly WinSxS cleanup and WSL/Docker disk compaction'
                Triggers = @(New-ScheduledTaskTrigger -Weekly -WeeksInterval 4 -DaysOfWeek Sunday -At 1pm) }
         )
         foreach ($j in $jobs) {
             $psArgs = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Root\auto_delete_junk_files.ps1`" $($j.Args)"
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs -WorkingDirectory $Root
-            Register-ScheduledTask -TaskName $j.Name -Action $action -Trigger $j.Triggers `
-                                   -Principal $principal -Settings $settings `
-                                   -Description "$AppName v$Version - $($j.Desc)" `
-                                   -Force -ErrorAction Stop | Out-Null
+            $reg = @{
+                TaskName    = $j.Name
+                Action      = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs -WorkingDirectory $Root
+                Principal   = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+                                                         -LogonType Interactive -RunLevel $j.Level
+                Settings    = $settings
+                Description = "$AppName v$Version - $($j.Desc)"
+            }
+            if ($j.Triggers) { $reg.Trigger = $j.Triggers }
+            Register-ScheduledTask @reg -Force -ErrorAction Stop | Out-Null
         }
         return $true
     } catch {
@@ -1049,7 +1057,7 @@ function Install-ScheduledTask ([string]$Root) {
 # Starting your own task needs no UAC prompt, and the task runs elevated, so a
 # plain double-click still cleans the admin-only targets. Returns $false when
 # there is no task (setup.bat never ran elevated) so the caller cleans what it can.
-function Invoke-ElevatedHandoff {
+function Invoke-ElevatedHandoff ([bool]$SystemHalf) {
     if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return $false }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) { return $false }
@@ -1059,8 +1067,8 @@ function Invoke-ElevatedHandoff {
         $v = $script:BoundArgs[$k]
         if ($v -is [switch]) { $a[$k] = [bool]$v }
     }
-    # the task itself carries -NoGates for the daily run; a manual run keeps its own choice
-    $a['NoGates'] = [bool]$NoGates
+    # the elevated side reads CleanSystem as "do the system group" and never does the dev group
+    $a['CleanSystem'] = $SystemHalf
 
     try {
         $a | ConvertTo-Json | Out-File -FilePath $HandoffFile -Encoding utf8 -Force
@@ -1085,7 +1093,7 @@ function Invoke-ElevatedHandoff {
 function Uninstall-ScheduledTask {
     try {
         if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-            foreach ($n in @($TaskName, "${TaskName}Monthly")) {
+            foreach ($n in @($TaskName, "${TaskName}Daily", "${TaskName}Monthly")) {
                 if (Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue) {
                     Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction Stop
                     Write-Color "[SUCCESS] Scheduled task '$n' removed." "Green"
@@ -1145,9 +1153,9 @@ function Install-Application {
     if (Install-ScheduledTask -Root $root) {
         # The task supersedes the shortcut - having both would clean twice per login
         if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue }
-        Write-Color "[SUCCESS] Scheduled task '$TaskName' registered: daily at 12:00 and at logon," "Green"
-        Write-Color "          running elevated, so Windows Temp, Windows Update and" "Green"
-        Write-Color "          Delivery Optimization are cleaned too." "Green"
+        Write-Color "[SUCCESS] Scheduled task '${TaskName}Daily' registered: daily at 12:00 and at logon." "Green"
+        Write-Color "          It hands the system caches to the elevated '$TaskName' task, so" "Green"
+        Write-Color "          Windows Temp, Windows Update and Delivery Optimization are cleaned too." "Green"
         Write-Color "[SUCCESS] Scheduled task '${TaskName}Monthly' registered: every 4 weeks," "Green"
         Write-Color "          WinSxS cleanup and WSL/Docker disk compaction." "Green"
     } elseif ($shortcutOk) {
@@ -1308,15 +1316,29 @@ function Main {
         exit 0
     }
 
-    # -CleanProjects takes a path and project folders need no admin, so it stays non-elevated
-    if (-not $script:IsAdmin -and -not $script:Echo -and -not $CleanProjects -and (Invoke-ElevatedHandoff)) { exit 0 }
-
-    if ($UnusedApps) { Show-UnusedApps; exit 0 }
-
     $doSystem = $All -or $CleanSystem -or (-not $CleanDev -and -not $CleanProjects -and -not $CleanSystem)
     $doDev    = $All -or $CleanDev    -or (-not $CleanSystem -and -not $CleanProjects -and -not $CleanDev)
 
     if ($Maintenance) { $DeepClean = $true; $CompactVHD = $true; $doSystem = $false; $doDev = $false }
+    if ($UnusedApps)  { $doSystem = $false; $doDev = $false }
+
+    # A handed-off job is the system half only. Developer caches are user-owned and
+    # their tools (uv, pip, pnpm) sit in user-writable folders, so the elevated
+    # task never runs them: the caller keeps the dev half and does it itself.
+    if ($script:Echo) { $doSystem = [bool]$CleanSystem; $doDev = $false }
+
+    # -CleanProjects takes a path and project folders need no admin, so it stays non-elevated
+    $handedOff = $false
+    if (-not $script:IsAdmin -and -not $script:Echo -and -not $CleanProjects -and
+        ($doSystem -or $DeepClean -or $CompactVHD -or $UnusedApps -or $EmptyRecycleBin)) {
+        $handedOff = Invoke-ElevatedHandoff -SystemHalf $doSystem
+    }
+    if ($handedOff) {
+        if (-not $doDev -and -not $DockerPrune) { exit 0 }
+        $doSystem = $false; $DeepClean = $false; $CompactVHD = $false; $EmptyRecycleBin = $false
+    }
+
+    if ($UnusedApps) { Show-UnusedApps; exit 0 }
 
     $mode = if ($Report) { "SIZE REPORT" } elseif ($Test) { "DRY RUN" } else { "CLEANING" }
     Write-Color "==================================================" "Cyan"
@@ -1333,7 +1355,7 @@ function Main {
         Write-Color ("  Free on {0}  {1} of {2}  ({3}%)  -  {4}" -f $env:SystemDrive,
             (Format-Size $free.Free), (Format-Size $free.Total), $free.Percent, $policy.Label) "Gray"
     }
-    if (-not $script:IsAdmin) {
+    if (-not $script:IsAdmin -and -not $handedOff) {
         Write-Color "  Not elevated: Windows Temp, Windows Update, Delivery" "Gray"
         Write-Color "  Optimization and CBS logs will be skipped this run." "Gray"
         Write-Color "  Run setup.bat once (one UAC prompt) and every later run cleans them too." "Yellow"
@@ -1357,7 +1379,7 @@ function Main {
     if ($doSystem) { $total += Invoke-Group -Group 'System' -TestMode $Test -ReportMode $Report -IgnoreGate $Force -GateScale $sysScale }
     if ($doDev)   { $total += Invoke-Group -Group 'Dev'    -TestMode $Test -ReportMode $Report -IgnoreGate $Force -GateScale $policy.GateScale }
 
-    if ($DockerPrune -and -not $Report -and -not $Test) {
+    if ($DockerPrune -and -not $Report -and -not $Test -and -not $script:Echo) {
         if (Get-Command docker -ErrorAction SilentlyContinue) {
             docker info -f "{{.Name}}" 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) {
@@ -1383,7 +1405,7 @@ function Main {
     }
 
     # ---- report-only findings: never deleted, only surfaced ------------------
-    if ($Report -or $Test) {
+    if (($Report -or $Test) -and -not $handedOff) {
         [void](Show-WindowsOld)
         Show-LargeUserFiles
         if ($Report) { Show-UnusedApps }
