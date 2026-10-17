@@ -1,6 +1,23 @@
+# Generated runtime artifacts
+cleanup_log.txt
+cleanup_report.json
+setup_log.txt
 last_run.txt
+run_silent.bat
+cleanup.lock
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.exe
-*.log
+.venv/
+venv/
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor
+.vscode/
+.idea/

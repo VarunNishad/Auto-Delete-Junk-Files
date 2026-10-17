@@ -1,3 +1,9 @@
-win10toast
-winshell
-pywin32
+# Pinned to versions verified working in setup (Python 3.14, Windows 11).
+# Bump only after re-running `python test_engine.py` on the new combination.
+
+# Toast notifications (replaces the abandoned win10toast)
+winotify==1.1.0
+# Shortcut creation for the Windows-startup integration
+winshell==0.6
+# COM access used for elevation (UAC) relaunch
+pywin32==312
