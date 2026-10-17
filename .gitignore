@@ -6,6 +6,14 @@ last_run.txt
 run_silent.bat
 cleanup.lock
 
+# Config the engine auto-generates with built-in defaults on first run
+# (delete the local file to reset to the engine's default catalog)
+targets.json
+
+# Internal dev-only work notes
+IMPROVEMENT_PLAN.md
+SETUP_PLAN.md
+
 # Python
 __pycache__/
 *.pyc

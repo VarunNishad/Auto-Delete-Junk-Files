@@ -10,7 +10,7 @@ logs every run to `cleanup_log.txt`.
 
 ## Features
 
-- 🧹 **Windows folders + dev-tool caches in one place** — see `targets.json`
+- 🧹 **Windows folders + dev-tool caches in one place** — see `--list-targets`
 - 🔒 **Permission-aware** — access-denied targets are reported
   (`needs Administrator`), never silently "0 files"
 - 🛡️ **Path safety** — targets outside allowed roots (temp/AppData/etc.) are refused
